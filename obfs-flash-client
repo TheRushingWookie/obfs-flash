@@ -25,6 +25,10 @@ from twisted.protocols.portforward import ProxyServer as _ProxyServer
 from twisted.python import log
 from txsocksx.client import SOCKS4ClientEndpoint
 
+import shlex
+
+import logging
+
 PT_METHOD_NAME = "obfs3_flashproxy"
 
 def pt_child_env(managed_ver, env=os.environ):
@@ -221,11 +225,12 @@ if sys.platform == "win32":
 def pt_launch_child(reactor, client, methodnames, cmdline):
     """Launch a child PT and ensure it has the right transport methods."""
     cur_env = pt_child_env(ManagedTransportProtocolV1.protocol_version)
+    environment = dict(cur_env + {
+            "TOR_PT_CLIENT_TRANSPORTS": ",".join(methodnames),
+        }.items())
     sub_proc = Popen(cmdline,
         stdout = PIPE,
-        env = dict(cur_env + {
-            "TOR_PT_CLIENT_TRANSPORTS": ",".join(methodnames),
-        }.items()),
+        env = environment,
         )
     sub_protocol = ManagedTransportProtocolV1()
     # we ought to pass reactor=reactor in below, but this breaks Twisted 12
@@ -242,75 +247,176 @@ def pt_require_child(client, childmethod, cmethods):
         raise ValueError()
     return cmethods[childmethod]
 
-def obfs3_flashproxy(reactor, client, obfs_out, fp_remote, fp_args=[], fp_local=0):
+
+
+def launch_pt_pair(reactor, client, callback_port, configuration):
+    """
+    Launches a pair of pluggable transports. Currently only supports chaining two transports together.
+    The pair is set by PT_METHOD_NAME
+    :param twisted.internet.interfaces.IReactor reactor: Reactor to install this PT to.
+    :param pyptlib.client.ClientTransportPlugin client: PT client API.
+    :param int callback_port: Local listen port for obfsproxy to connect to.
+    """
+    if PT_METHOD_NAME in configuration.alias_map:
+        pt_chain = configuration.alias_map[PT_METHOD_NAME]
+    else:
+        logging.error('Pluggable Transport Combination %s not found in configuration alias map.' % PT_METHOD_NAME)
+        raise KeyError()
+
+    defer_list = []
+
+    for pt in pt_chain:
+        if pt in configuration.transport_map:
+            pt_cmdline = configuration.transport_map[pt]
+        else:
+            logging.error("Pluggable transport %s not found in transport_map. Check your configuration file." % str(pt))
+            raise ValueError()
+        _, _, defer = pt_launch_child(reactor, client, [pt], pt_cmdline)
+        defer_list.append(defer[0])
+    whenAllDone = DeferredList(defer_list, consumeErrors=False)
+
+    def allDone(success_list):
+
+        success = all(r[0] for r in success_list)
+        # failure was already reported by pt_require_child, just return
+        if not success: return
+
+        result1 = [r[1] for r in success_list if r[1].name == pt_chain[0]][0] # Normally obfs3 result
+        result2 = [r[1] for r in success_list if r[1].name == pt_chain[1]][0] # Normally flashproxy result
+        destination_port = result2.addrport[1] # if port was 0, read the actual port
+        # shim to wrap obfs data output to SOCKS input for flashproxy
+        reactor.listenTCP(interface='127.0.0.1', port=callback_port, factory=
+            SOCKS4WrapperFactory('127.0.0.1', destination_port, '0.0.1.0', 1))
+        # now report success of the overall composed PT
+        client.reportMethodSuccess(PT_METHOD_NAME, result1.protocol, result1.addrport)
+        client.reportMethodsEnd()
+    whenAllDone.addCallback(allDone)
+
+
+class Config():
+
+    transport_map = {}
+    alias_map = {}
+    def __init__(self, transport_map, alias_map):
+        self.transport_map = transport_map
+        self.alias_map = alias_map
+
+    def __repr__(self):
+        return "Config(" + str(self.transport_map) + ", " + str(self.alias_map) + ")"
+
+    @classmethod
+    def parse(cls, config_string):
+        """
+        Reads a configuration string and returns an instance of configuration. Uses shlex to parse configuration lines.
+        :param String config_string: The string which will be parsed to populate the transport_map and alias_map hash tables.
+        See the file example-fog-config for format.
+        """
+        # TODO Add possibility of reading a ClientTransportPlugin with multiple transport types
+        # EX: ClientTransportPlugin obfs3,scramblesuit obfsclient --option=value
+        transport_map = {}
+        alias_map = {}
+        line_counter = 0
+        lines = config_string.split('\n')
+
+        for line in lines:
+            line_counter += 1
+            if len(line) > 0: # Check for empty lines
+                line = line.strip()
+                lexer = shlex.shlex(line)
+                lexer.whitespace_split = True # Ensure shlex only splits on whitespace instead of splitting on pipes and dashes too.
+                delimited_tokens = list(lexer)
+                if len(delimited_tokens) > 1:
+                    config_line_type = delimited_tokens[0] # This can be either Alias or ClientTransportPlugin
+                    if config_line_type == 'ClientTransportPlugin':
+                        transport_name = delimited_tokens[1]
+                        transport_cmdline = delimited_tokens[2:]
+                        if transport_name in transport_map:
+                            logging.warn('Configuration file has duplicate ClientTransportPlugin lines. Duplicate line is at line number %s' % str(line_counter))
+                        transport_map[transport_name] = transport_cmdline
+                    elif config_line_type == 'Alias':
+                        alias_name = delimited_tokens[1] # Example: "obfs_flashproxy"
+                        alias_path = delimited_tokens[2].split('|') # Example: "obfs3|flashproxy"
+                        if alias_name in alias_map:
+                            logging.warn('Configuration file has duplicate Alias lines. Duplicate line is at line number %s' % str(line_counter))
+                        alias_map[alias_name] = alias_path
+                    else:
+                        logging.warning("Configuration file has unknown line %s: '%s'" % (str(line_counter), line))
+        return cls(transport_map, alias_map)
+
+def obfs3_flashproxy(reactor, client, callback_port, fp_remote, fp_args=[], fp_local=0):
     """
     Set up the obfs3_flashproxy combined PT.
 
     :param twisted.internet.interfaces.IReactor reactor: Reactor to install this PT to.
     :param pyptlib.client.ClientTransportPlugin client: PT client API.
-    :param int obfs_out: Local listen port for obfsproxy to connect to.
+    :param int callback_port: Local listen port for obfsproxy to connect to.
     :param str fp_remote: Listen address for remote flashproxy connections.
     :param int fp_local: Local listen port for local flashproxy connections.
     """
+
     ob_client = os.getenv("OBFSPROXY", "obfsproxy")
     fp_client = os.getenv("FLASHPROXY_CLIENT", "flashproxy-client")
 
-    # start fp and ensure that it launches OK
-    _, _, fp_defer = pt_launch_child(reactor, client,
-        ["flashproxy"], [fp_client, "--transport", "obfs3|websocket"] + fp_args +
-                       ['127.0.0.1:%s' % fp_local, fp_remote])
+    fp_cmdline =  [fp_client, "--transport", '"obfs3|websocket"'] + fp_args + ['127.0.0.1:%s' % fp_local, fp_remote]
+    obfs_cmd_line = [ob_client, "managed"]
 
-    # start ob and ensure that it launches OK
-    _, _, ob_defer = pt_launch_child(reactor, client,
-        ["obfs3"], [ob_client, "managed"])
+    transport_map = {'obfs3': obfs_cmd_line, 'flashproxy': fp_cmdline}
+    alias_map = {'obfs3_flashproxy': ['obfs3', 'flashproxy']}
 
-    whenAllDone = DeferredList(fp_defer + ob_defer, consumeErrors=True)
-    def allDone(success_list):
-        success = all(r[0] for r in success_list)
-        # failure was already reported by pt_require_child, just return
-        if not success: return
-        fp_result = [r[1] for r in success_list if r[1].name == "flashproxy"][0]
-        ob_result = [r[1] for r in success_list if r[1].name == "obfs3"][0]
-
-        fp_port = fp_result.addrport[1] # if port was 0, read the actual port
-        # shim to wrap obfs data output to SOCKS input for flashproxy
-        reactor.listenTCP(interface='127.0.0.1', port=obfs_out, factory=
-            SOCKS4WrapperFactory('127.0.0.1', fp_port, '0.0.1.0', 1))
-
-        # now report success of the overall composed PT
-        client.reportMethodSuccess(PT_METHOD_NAME, ob_result.protocol, ob_result.addrport)
-        client.reportMethodsEnd()
-    whenAllDone.addCallback(allDone)
+    configuration = Config(transport_map, alias_map)
+    launch_pt_pair(reactor, client, callback_port, configuration) # Launch
 
 def main(*args):
     parser = argparse.ArgumentParser()
-    parser.add_argument("obfs_out", help="local listen port for obfsproxy to "
-        "connect to. This must match the appropriate 'Bridge %s' line in your "
-        "torrc." % PT_METHOD_NAME,
+    parser.add_argument("callback_port", help="local listen port for obfsproxy to "
+        "connect to. This must match the appropriate bridge line in your " # TODO print bridge line
+        "torrc.",
         metavar='PORT', type=int)
     parser.add_argument("fp_remote", help="remote connections listen address "
         "for flashproxy, default %(default)s",
         metavar='REMOTE:PORT', nargs='?', default=":9000")
     parser.add_argument("--fp-arg", help="arguments for flashproxy-client",
         metavar='ARG', action='append')
+    parser.add_argument("-fogfile", help="fog configuration file path",
+        metavar='FOG FILE', type=argparse.FileType('r'))
+    parser.add_argument("-pt_method_name", help="The plugin chain to be run.",
+        metavar='PT METHOD NAME')
+
     # TODO(infinity0): add an "external" mode, which would require us to run
     # obfsproxy in external mode too.
 
     opts = parser.parse_args(args)
+
     # ensure str address is valid
     _, _, = parse_addr_spec(opts.fp_remote, defhost="0.0.0.0")
+    configuration = None
+
+    if opts.pt_method_name:
+        PT_METHOD_NAME = opts.pt_method_name
+    else:
+        PT_METHOD_NAME = "obfs3_flashproxy"
+
+    if opts.fogfile:
+        file_contents = opts.fogfile.read()
+        configuration = Config.parse(file_contents)
 
     client = ClientTransportPlugin()
     client.init([PT_METHOD_NAME])
     if not client.getTransports():
-        print >> sys.stderr, "no transports to serve"
+        logging.error("no transports to serve. pt_method_name may be invalid.")
         return 1
 
     from twisted.internet import reactor
     auto_killall(1, cleanup=reactor.stop)
-    obfs3_flashproxy(reactor, client, opts.obfs_out, opts.fp_remote, opts.fp_arg or [])
+    if configuration:
+        launch_pt_pair(reactor, client, opts.callback_port, configuration)
+    else:
+        logging.warning("No configuration file specified. Defaulting to launching obfs|flashproxy pair.")
+        obfs3_flashproxy(reactor, client, opts.callback_port, opts.fp_remote, opts.fp_arg or [])
+
     reactor.run(installSignalHandlers=0)
     return 0
 
 if __name__ == "__main__":
     sys.exit(main(*sys.argv[1:]))
+
