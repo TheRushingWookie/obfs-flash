@@ -34,7 +34,7 @@ class SOCKSv4InterceptorProtocol(socks.SOCKSv4):
                 d = self.connectClass(remote_addr_port[0], remote_addr_port[1], socks.SOCKSv4Outgoing, self)
                 d.addErrback(lambda result, self = self: self.makeReply(91))
             try:
-                self.factory._new_conn_callback((server, port), self._pt_method_name, _chain_set_up)
+                self.factory._new_conn_callback((server, port), self._pt_method_name, _chain_set_up, user)
             except:
                 self.makeReply(91)
                 raise

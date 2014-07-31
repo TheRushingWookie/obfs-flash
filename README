@@ -14,3 +14,11 @@ Run-time dependencies:
 export GOPATH=$(pwd)
 go get
 make
+
+# Configuring the Client
+The client uses the fogrc file inside ./fog-client to configure a fog transport.
+If you need to provide parameters to client transports, see the torrc in ./fog-client for how to send them.
+
+# Configuring the Server
+The fog server uses fogrc file inside ./fog-server to configure server transports.
+If you need to provide parameters to client transports, see the fogrc in ./fog-server for how to send them.

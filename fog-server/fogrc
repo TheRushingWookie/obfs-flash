@@ -7,6 +7,17 @@
 #For chaining transports together, an alias line is used.
 #Alias chainname firsttransportname|secondtransportname
 #tor expects alias to use underscores instead of pipes. So an alias links the tor version of a plugin chain to the actual plugins. See ticket #9580
+#
+# To pass parameters to a Server Transport, a ServerTransportOptions is used.
+# The ServerTransportOptions line supports two formats, the name format and the number format.
+# The name format is the cleanest to read and edit but it does not support providing different parameters to the same transport. For instance if the chain was scramblesuit|scramblesuit, the name format would provide the same password parameter to both of scramblesuit instances. If you need need to provide different parameters to the same transport, consider using the num format.
+# All parameters lines start with a fmt key value like this fmt=name or fmt=num
+# The name format has the syntax pt=pt_name key=value key2=value2 etc
+# For instance to pass a password parameter using the name format to a pluggable transport called scramblesuit and a different parameter to a b64 transport, the ServerTransportOptions line would be
+#ServerTransportOptions scramblesuit_b64 fmt=name pt=scramblesuit password=helloworld&pt=b64 param=example_value
+# The other format is fog-n-key=val where n is the nth transport in the chain (Zero indexed). So to pass a parameter to the first transport, it would be fog-0-key=val fog-0-key2=val2. To pass a parameter to the second param it would be fog-1-key=val fog-1=key2=val2
+# Example ServerTransportOptions num format line
+#ServerTransportOptions scramblesuit_b64 fmt=num pt-0-password=helloworld&pt-1-param=example_value
 
 ServerTransportPlugin obfs3 obfsproxy managed
 ServerTransportPlugin websocket pt-websocket-server

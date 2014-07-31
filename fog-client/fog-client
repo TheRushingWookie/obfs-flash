@@ -179,11 +179,7 @@ class OneUseSOCKSWrapper(ProxyServer):
             local_host,
             local_port)
         # Next PT may need either SOCKS4 or SOCKS5 so check its protocol and get the required class
-        socks_endpoint_class = self.getSocksEndpointClass()
-        SOCKSPoint = socks_endpoint_class(
-                    self.factory.remote_host,
-                    self.factory.remote_port,
-                    TCPPoint)
+        SOCKSPoint = self.getSocksPoint(TCPPoint)
         # Store port for debugging messages before stopListening is called.
         # listen_port will not have a port after stopListening is called.
         stored_port = self.factory.listen_port.getHost().port
@@ -198,35 +194,53 @@ class OneUseSOCKSWrapper(ProxyServer):
         def _gotError(error):
             log.err(error, "error connecting to SOCKS server")
 
-    def getSocksEndpointClass(self):
+    def getSocksPoint(self, TCPPoint):
         """
-        Checks self.factory.method_spec.protocol and returns the appropriate socks endpoint class.
+        Checks self.factory.method_spec.protocol and returns the appropriate SOCKS Point object.
         """
         socks_endpoint_class = None
+        SOCKSPoint = None
         if self.factory.method_spec.protocol == 'socks4':
             socks_endpoint_class = SOCKS4ClientEndpoint
+            SOCKSPoint = socks_endpoint_class(
+                        self.factory.remote_host,
+                        self.factory.remote_port,
+                        TCPPoint,
+                        user = str(self.factory.pt_option.params))
         elif self.factory.method_spec.protocol == 'socks5':
             socks_endpoint_class = SOCKS5ClientEndpoint
+            socks_login = self.factory.pt_option.to_SOCKS_form()
+            socks_parameter_dict = {'anonymous': ()} # Default to anonymous login.
+            print len(socks_login)
+            if len(socks_login) >= 1:
+                socks_parameter_dict = {'login':(socks_login[:-1], socks_login[-1])} # RFC1929 says something has to be in both user and password fields.
+
+            SOCKSPoint = socks_endpoint_class(
+                        self.factory.remote_host,
+                        self.factory.remote_port,
+                        TCPPoint,
+                        methods=socks_parameter_dict)
         else:
             raise ValueError("Pluggable transport requires unknown protocol %s. Supported protocols are %s" %
                             (self.factory.method_spec.protocol, ('socks4', 'socks5')))
-        return socks_endpoint_class
+        return SOCKSPoint
 
 class OneUseSOCKSFactory(Factory):
     protocol = OneUseSOCKSWrapper
-    def __init__(self, method_spec, dest_addr_port):
+    def __init__(self, method_spec, dest_addr_port, pt_option):
         self._connected_once = False
         self.method_spec = method_spec
         self.remote_host = dest_addr_port[0]
         self.remote_port = dest_addr_port[1]
         self.d_connected = Deferred()
         self.listen_port = None
+        self.pt_option = pt_option
 
     def __str__(self):
-        return "OneUseSOCKSFactory connecting %s to %s:%s" % (self.method_spec, self.remote_host, self.remote_port)
+        return "OneUseSOCKSFactory connecting %s to %s:%s with pt_option %s" % (self.method_spec, self.remote_host, self.remote_port, repr(self.pt_option))
 
     def __repr__(self):
-        return "OneUseSOCKSFactory(%s, %s, %s)" % (self.method_spec, self.remote_host, self.remote_port)
+        return "OneUseSOCKSFactory(%s, %s, %s, %s)" % (self.method_spec, self.remote_host, self.remote_port, repr(self.pt_option))
 
     def setListenPort(self, listen_port):
         """
@@ -380,11 +394,10 @@ class FogClient():
             all_chains_defer_list.append(chain_deferred_list)
         return DeferredList(all_chains_defer_list)
 
-    def pt_setup_socks_shim(self, pt_name, pt_chain, success_list, dest_addr_port, proxy_deferreds):
+    def pt_setup_socks_shim(self, pt_option, success_list, dest_addr_port, proxy_deferreds):
         """
         Launches a socks proxy server to link two PTs together.
-        :param str pt_name: The name of the pt to send traffic to.
-        :param list pt_chain: The list of PTs in this chain.
+        :param PTOption pt_option: An object containing the parameters and name of the pt.
         :param list success_list: A list of tuples containing a launch status boolean, MethodSpec pairs.
             Ex: [(True, MethodSpec(name='dummy', protocol='socks4', addrport=('127.0.0.1', 58982), args=[], opts=[])),
                 (True, MethodSpec(name='b64', protocol='socks4', addrport=('127.0.0.1', 58981), args=[], opts=[]))]
@@ -394,36 +407,37 @@ class FogClient():
 
         :returns twisted.internet.interfaces.IListeningPort: An IListeningPort used for shutting down a factory after a connection is made.
         """
-        methodspec = [r[1] for r in success_list if r[1].name == pt_name][0] # Returns the resulting methodspec.
-        factory = OneUseSOCKSFactory(methodspec, dest_addr_port)
+        methodspec = [r[1] for r in success_list if r[1].name == pt_option.pt_name][0] # Returns the resulting methodspec.
+        factory = OneUseSOCKSFactory(methodspec, dest_addr_port, pt_option)
         # TODO switch to using endpoints instead of listenTCP
         proxy_server = self.reactor.listenTCP(interface='127.0.0.1', port=0, factory=factory)
         factory.setListenPort(proxy_server)
         proxy_deferreds.append(factory.whenConnected())
-        logger.debug("launched %s on port %s with dest %s" % (pt_name, proxy_server.getHost().port, dest_addr_port))
+        logger.debug("launched %s on port %s with dest %s" % (pt_option.pt_name, proxy_server.getHost().port, dest_addr_port))
         return proxy_server
 
-    def pt_launch_chain(self, dest_addr_port, pt_chain, _chain_set_up, success_list):
+    def pt_launch_chain(self, dest_addr_port, pt_chain, _chain_set_up, success_list, options):
         """
         Launches a chain of pluggable transports by connecting each pt with SOCKS proxies.
         :param tuple dest_addr_port: The bridge address:port pair to connect to.
         :param list pt_chain: The list of pt names to launch.
         :param function _chain_set_up: The function to call when the shims have been set up.
+        :param twisted.internet.interfaces.IReactor reactor: Reactor to install this PT to.
         :param list success_list: A list of tuples containing a launch status boolean, MethodSpec pairs.
             Ex: [(True, MethodSpec(name='dummy', protocol='socks4', addrport=('127.0.0.1', 58982), args=[], opts=[])),
                 (True, MethodSpec(name='b64', protocol='socks4', addrport=('127.0.0.1', 58981), args=[], opts=[]))]
+        :param str options: A string containing the pt options from the SOCKS request.
         """
         proxy_deferreds = []
-        last_pt_name = pt_chain[-1]
+        pt_options = PTOption.parse_pt_parameters(options, pt_chain)
+        last_pt_option = pt_options[-1]
         logger.debug("launching chain %s" % pt_chain)
         # Initialize prev_server to the port picked by the last proxy server as that's the only one we know yet.
-        last_server = self.pt_setup_socks_shim(last_pt_name, pt_chain, success_list, dest_addr_port,
-                                        proxy_deferreds)
+        last_server = self.pt_setup_socks_shim(last_pt_option, success_list, dest_addr_port, proxy_deferreds)
         prev_server = last_server
-        for pt_name in reversed(pt_chain[:-1]):
+        for pt_option in reversed(pt_options[:-1]):
             # Loops through the pts linking them together through SOCKS proxies, skipping the last pt.
-            prev_server = self.pt_setup_socks_shim(pt_name, pt_chain, success_list, ('127.0.0.1', prev_server.getHost().port),
-                                            proxy_deferreds)
+            prev_server = self.pt_setup_socks_shim(pt_option, success_list, ('127.0.0.1', prev_server.getHost().port), proxy_deferreds)
         def check_chain_all_connected(protocol_list):
             """
             Checks all the shims launched to see if they successfully connected.
@@ -438,7 +452,6 @@ class FogClient():
                 # This assumes that the child pluggable transport will shut down the connection cleanly.
                 failed_protocols = [x[1] for x in protocol_list if x[0] == False]
                 logger.error("Shims %s failed to connect." % failed_protocols)
-                raise ValueError()
 
         finished = DeferredList(proxy_deferreds)
         finished.addCallback(check_chain_all_connected)
@@ -458,8 +471,8 @@ class FogClient():
         # failure was already reported by pt_require_child, just return
         if not success: return
         socks_interceptor = SOCKSv4InterceptorFactory(pt_method_name,
-                            lambda dest_addr_port, pt_method_name, chain_finished:
-                                self.pt_launch_chain(dest_addr_port, pt_chain, chain_finished, success_list))
+                            lambda dest_addr_port, pt_method_name, chain_finished, options:
+                                self.pt_launch_chain(dest_addr_port, pt_chain, chain_finished, success_list, options))
         # TODO switch to using endpoints instead of listenTCP
         try:
             interceptor = self.reactor.listenTCP(interface='127.0.0.1', port=0, factory=socks_interceptor)
@@ -537,7 +550,7 @@ class Config():
         alias_name = delimited_tokens[1] # Example: "obfs3_flashproxy"
         alias_path = delimited_tokens[2].split('|') # Example: "obfs3|flashproxy"
         if alias_name in alias_map:
-            raise ValueError('Configuration file has duplicate Alias lines. Duplicate line is at line number %s' % line_counter)
+            raise ValueError('Configurat`ion file has duplicate Alias lines. Duplicate line is at line number %s' % line_counter)
         for pt_name in alias_path:
             if pt_name not in transport_map:
                 raise KeyError('Transport map is missing pluggable transport %s needed for chain %s. Check your configuration file for a ClientTransportPlugin line can launch %s' % (pt_name, alias_name, pt_name))
@@ -557,6 +570,83 @@ class Config():
                 else:
                     chains_by_cmdlines_map[cmdline] = (chain, )
         return chains_by_cmdlines_map
+
+class PTOption(object):
+    """ Contains methods used to parse and retrieve pt options """
+
+    pt_name = None
+    params = {}
+
+    def __init__(self, name):
+        self.pt_name = name
+
+    def __repr__(self):
+        return "PTOption(%s)" % (self.pt_name)
+
+    def __str__(self):
+        return "PTOption %s with options %s" % (self.pt_name, self.params)
+
+    def to_SOCKS_form(self):
+        """
+        Returns the pt options in the form specified by PT-Spec. Key values are joined with '=' and each key value pair is joined with ';'
+        """
+        return  ";".join(["=".join(key_val)for key_val in self.params.items()])
+
+    @classmethod
+    def parse_pt_parameters(cls, parameter_string, chain):
+        """
+        Creates and returns a list of dictionaries containing pt options.
+        :param str parameter_string: The options string from a socks request
+        :param list chain: The list of pt names.
+        """
+        chain_params = [PTOption(pt) for pt in chain]
+        if len(parameter_string) > 0:
+            first_space = parameter_string.find('&')
+            fmt_string = parameter_string[:first_space]
+            format = fmt_string[fmt_string.find('fmt=') + 4:]
+            parameter_string = parameter_string[first_space + 1:]
+            parameter_string = parameter_string.strip()
+            if format == 'num':
+                cls._parse_num_param_string(parameter_string, chain_params)
+            elif format == 'name':
+                cls._parse_name_param_string(parameter_string, chain_params, chain)
+            else:
+                logger.warn("""Format %s is not a valid format for SOCKS paramaters. Check fogrc configuration string for chain %s.
+                            Valid formats are 'fmt=num' or 'fmt=name'""", format, chain)
+                raise ValueError()
+        else:
+            logger.debug("Empty parameter string for chain %s", chain)
+        return chain_params
+
+    @classmethod
+    def _parse_num_param_string(cls, parameter_string, chain_params):
+        """
+        Parses parameter_string of format: fog-n-k-v fog-(n+1)-k-v
+        Ex "fmt=num fog-0-key=val fog-0-key2=val2 fog-1-key=val fog-1-key2=val2"
+        """
+        split_params = parameter_string.split('&')
+        for param in split_params:
+            pt_index = int(param[4])
+            pt_param = param[param.find('-', 4) + 1:]
+            param_key, param_val = pt_param.split('=')
+            chain_params[pt_index].params[param_key] = param_val
+
+    @classmethod
+    def _parse_name_param_string(cls, parameter_string, chain_params, chain):
+        """
+        Parses parameter_string of format: pt=ptname key=val key1=val2&
+        Ex "fmt=name pt=ptname key=val key2=val2&pt=ptname user=key password=val"
+        """
+        index_by_pt = dict(zip(chain, range(len(chain))))
+        pt_param_sets = parameter_string.split('&')
+        for pt_params in pt_param_sets:
+            pt_param_list = pt_params.split(';')
+            pt_name_kv = pt_param_list[0]
+            pt_name = pt_name_kv.split('=')[1]
+            pt_index = index_by_pt[pt_name]
+            for pt_param in pt_param_list[1:]:
+                key, val = pt_param.split('=')
+                chain_params[pt_index].params[key] = val
 
 def main(*args):
     parser = argparse.ArgumentParser()

@@ -1,3 +1,12 @@
+# To pass parameters to a fog transport, the parameters are added to the normal torrc bridge lines.
+# There are two formats for passing the paremeters.
+# All parameters lines start with a fmt key value like this fmt=name or fmt=num
+# The name format has the syntax pt=pt_name key=value key2=value2 etc
+# For instance to pass a password parameter using the name format to a pluggable transport called scramblesuit and a different parameter to a b64 transport, the bridge line would be
+# Bridge scramblesuit_b64 [ip]:[port] fmt=name pt=scramblesuit password=helloworld&pt=b64 param=example_value
+# The other format is fog-n-key=val where n is the nth transport in the chain (Zero indexed). So to pass a parameter to the first transport, it would be fog-0-key=val fog-0-key2=val2. To pass a parameter to the second param it would be fog-1-key=val fog-1=key2=val2
+# Example bridge line
+# Bridge scramblesuit_b64 [ip]:[port] fmt=num pt-0-password=helloworld&pt-1-param=example_value
 UseBridges 1
 Bridge obfs3_flashproxy 127.0.0.1:9000
 LearnCircuitBuildTimeout 0

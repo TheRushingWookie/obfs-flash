@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"strings"
+	"strconv"
 )
 
 import "git.torproject.org/pluggable-transports/goptlib.git"
@@ -104,6 +105,11 @@ func ParseConfiguration(configString string, config *Configuration) (*Configurat
 					if err != nil {
 						return nil, err
 					}
+				} else if configLineType == "ServerTransportOptions" {
+					err = parseTransportOptions(config, delimitedTokens, lineCounter)
+					if err != nil {
+						return nil, err
+					}
 				} else {
 					log("Configuration file has unknown line %s: %s", lineCounter, line)
 				}
@@ -125,6 +131,78 @@ func parseTransportLine(config *Configuration, tokens []string, lineCounter int)
 	return nil
 }
 
+// Parses a ServerTransportOptions line.
+func parseTransportOptions(config *Configuration, tokens []string, lineCounter int) error {
+	chainName, ok := config.Aliases[tokens[1]]
+	optionsMap := make(map[string]pt.Args)
+	fmtKeyVal := strings.Split(tokens[2], "=")
+	if !ok {
+		return errors.New(fmt.Sprintf("Chain %s does not have a corresponding Alias line. Check your fogrc.", tokens[1]))
+	}
+	if fmtKeyVal[0] != "fmt" {
+		return errors.New(fmt.Sprintf("ServerTransportOptions line %s does not have fmt string after chain name", tokens))
+	}
+	if fmtKeyVal[1] == "name" {
+		err := parseNameTransportOptions(config, tokens, lineCounter, optionsMap)
+		if err != nil {
+			return err
+		}
+	} else if fmtKeyVal[1] == "num" {
+		err := parseNumTransportOptions(config, tokens, lineCounter, optionsMap, chainName)
+		if err != nil {
+			return err
+		}
+	}
+	config.Options = optionsMap
+	return nil
+}
+
+// Parses a ServerTransportOptions in the format fog-n-k-v
+// Ex: "fog-0-key=val fog-0-key2=val2 fog-1-key=val fog-1-key2=val2"
+func parseNumTransportOptions(config *Configuration, tokens []string, lineCounter int, optionsMap map[string]pt.Args, chainName string) error {
+	pts := strings.Split(chainName, "|")
+	for _, pt_name := range pts {
+		opts := make(pt.Args)
+		optionsMap[pt_name] = opts
+	}
+	for _, option := range tokens[3:] {
+		indexStart := strings.Index(option, "fog-") + 4
+		indexEnd := strings.Index(option[indexStart:], "-",)
+		index, err := strconv.Atoi(option[indexStart:][:indexEnd])
+		if err != nil {
+			errors.New(fmt.Sprintf("ServerTransportOption line %s has unknown chain index %s in .", tokens, option))
+		}
+		keyVal := strings.Split(option[indexStart:][indexEnd + 1:], "=")
+		ptName := pts[index]
+		optionsMap[ptName].Add(keyVal[0], keyVal[1])
+	}
+	return nil
+}
+
+// Parses a ServerTransportOptions in the format pt=ptname key=val key2=val2&pt=ptname2 key=val key2=val2
+// Ex: "pt=ptname key=val key2=val2&pt=ptname user=key password=val"
+func parseNameTransportOptions(config *Configuration, tokens []string, lineCounter int, optionsMap map[string]pt.Args) error {
+	firstPTNameStr := strings.Split(tokens[3], "=")
+	if firstPTNameStr[0] != "pt" {
+		return errors.New(fmt.Sprintf("ServerTransportOptions line %s:%s does not have a pt name for the first set of options", lineCounter, tokens))
+	}
+	opts := make(pt.Args)
+	ptName := firstPTNameStr[1]
+	optionsMap[ptName] = opts
+	for _, option := range tokens[3:] {
+		log("%s", option)
+		if nextPt := strings.Index(option, "&"); nextPt > -1 {
+			ptName = strings.Split(option[nextPt + 1:], "=")[1]
+			opts = make(pt.Args)
+			optionsMap[ptName] = opts
+			option = option[:nextPt]
+		}
+		keyVal := strings.Split(option, "=")
+		optionsMap[ptName].Add(keyVal[0], keyVal[1])
+		log("pt_name %s KEY VAL %s", ptName, keyVal)
+	}
+	return nil
+}
 // Parses an alias line
 // Ex: Alias b64_b64 b64|b64
 func parseAliasLine(config *Configuration, tokens []string, lineCounter int) error {

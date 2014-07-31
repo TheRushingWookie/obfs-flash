@@ -6,12 +6,11 @@
 #
 #For chaining transports together, an alias line is used.
 #Alias chainname firsttransportname|secondtransportname
-#tor expects alias to use underscores instead of pipes. So an alias links the tor version of a plugin chain to the actual plugins. See ticket #9580
-
+#tor expects aliases to use underscores instead of pipes. So an alias links the tor version of a plugin chain to the actual plugins. See ticket #9580
 ClientTransportPlugin obfs3 obfsproxy managed
-ClientTransportPlugin flashproxy flashproxy-client --transport obfs3|websocket --register 127.0.0.1:0 :9000 
+ClientTransportPlugin flashproxy flashproxy-client --transport obfs3|websocket --register 127.0.0.1:0 :9000
 # If port 9000 cannot be portforwarded change it to a port that can be ported like so:
 #ClientTransportPlugin flashproxy flashproxy-client --transport obfs3|websocket --register 127.0.0.1:0 :3923
 # use a different facilitator
-#ClientTransportPlugin flashproxy flashproxy-client --transport obfs3|websocket -f http://siteb.fp-facilitator.org/fac/ --register —-register-methods=http 127.0.0.1:0 :3923 
+#ClientTransportPlugin flashproxy flashproxy-client --transport obfs3|websocket -f http://siteb.fp-facilitator.org/fac/ --register —-register-methods=http 127.0.0.1:0 :3923
 Alias obfs3_flashproxy obfs3|flashproxy
